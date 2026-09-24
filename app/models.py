@@ -927,3 +927,93 @@ class IsotopeEnvelopeResponse(BaseModel):
     most_probable: IsotopePeak = Field(
         description="概率最高的峰；概率并列时取质量较小者"
     )
+
+
+# ------------------------------------------------------------ 盖斯定律反应焓推导
+class HessKnownReactionRequest(ReactionRequest):
+    """一条已知反应：完整反应式 + 以 kJ 计的反应焓十进制字符串。"""
+
+    enthalpy_kj: str = Field(
+        ...,
+        min_length=1,
+        description="该已知反应（按提交的唯一配平式）的反应焓，**任意**十进制"
+        "字符串（可负、可为 0，如 \"-285.8\"、\"+90.25\"），单位 kJ；"
+        "不要传 JSON 数字以避免浮点误差",
+        examples=["-285.8"],
+    )
+
+    @field_validator("enthalpy_kj")
+    @classmethod
+    def _strip_enthalpy(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("反应焓必须是十进制字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("反应焓不能为空白字符串")
+        return stripped
+
+
+class HessRequest(BaseModel):
+    """``POST /thermochemistry/hess`` 请求：目标反应与 1～6 条已知反应。"""
+
+    target: ReactionRequest = Field(description="待推导反应焓的目标反应")
+    known_reactions: list[HessKnownReactionRequest] = Field(
+        ...,
+        min_length=1,
+        max_length=6,
+        description="已知反应，1～6 条；每条含反应物、生成物与以 kJ 计的"
+        "反应焓十进制字符串。服务允许反向（倍数为负）与分数倍使用",
+    )
+
+
+class HessReactionBase(BaseModel):
+    """一条反应的原始回显与唯一配平后的规范化反应式。"""
+
+    reactants: list[str] = Field(description="客户端提交的原始反应物化学式")
+    products: list[str] = Field(description="客户端提交的原始生成物化学式")
+    normalized: NormalizedReaction = Field(description="唯一配平后的规范化反应式")
+
+
+class HessTargetResult(HessReactionBase):
+    """目标反应的回显与规范化反应式。"""
+
+
+class HessKnownReactionResult(HessReactionBase):
+    """一条已知反应的回显、规范化反应式与在盖斯组合中的使用倍数。"""
+
+    index: int = Field(description="已知反应序号（与请求 known_reactions 顺序一致，从 0 开始）")
+    enthalpy_kj: str = Field(description="客户端提交的反应焓（kJ，回显）")
+    multiplier: str = Field(
+        description="该已知反应在目标反应中的使用倍数，**精确十进制字符串**；"
+        "负值表示反向使用，0 表示未参与最小组合，分数倍精确给出有限小数"
+        "（无限小数按 28 位有效数字银行家舍入）"
+    )
+    contribution_kj: str = Field(
+        description="该反应对目标焓的贡献 = 倍数 × 已知反应焓（kJ）"
+    )
+
+
+class HessNetCoefficient(BaseModel):
+    """合并抵消后单个物种的净计量系数。"""
+
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: str = Field(
+        description="净计量系数十进制字符串：生成物侧为正、反应物侧为负；"
+        "抵消掉的中间体为 \"0\""
+    )
+
+
+class HessResponse(BaseModel):
+    target: HessTargetResult = Field(description="目标反应的规范化配平式")
+    known_reactions: list[HessKnownReactionResult] = Field(
+        description="各已知反应的配平式、使用倍数与焓贡献，与请求顺序一致"
+    )
+    target_enthalpy_kj: str = Field(
+        description="推导出的目标反应焓 = Σ(倍数 × 已知反应焓)，kJ，"
+        "十进制字符串"
+    )
+    net_coefficients: list[HessNetCoefficient] = Field(
+        description="合并抵消后的逐物种净系数（生成物为正、反应物为负），"
+        "覆盖目标与全部已知反应的物种并集，按规范化化学式排序；"
+        "恰好抵消的中间体系数为 \"0\""
+    )

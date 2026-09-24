@@ -45,6 +45,13 @@ from .stoichiometry import (
     fraction_to_decimal_string,
     parse_moles,
 )
+from .thermochemistry import (
+    BalancedReaction,
+    HessError,
+    HessKnownReaction,
+    parse_enthalpy,
+    solve_hess,
+)
 
 
 # 错误码 -> HTTP 状态码
@@ -62,6 +69,8 @@ STATUS_CODES = {
     "INVALID_BLEND": 422,
     "NO_FEASIBLE_BLEND": 422,
     "INVALID_ISOTOPE": 422,
+    "HESS_NOT_DERIVABLE": 422,
+    "HESS_AMBIGUOUS": 422,
 }
 
 
@@ -1515,4 +1524,186 @@ def process_isotope_envelope(
         ],
         "peaks": [render_peak(peak) for peak in peaks],
         "most_probable": render_peak(top),
+    }
+
+
+# ------------------------------------------------------------ 盖斯定律反应焓推导
+def _balanced_reaction(
+    reactant_texts: list[str], product_texts: list[str]
+) -> tuple[BalancedReaction, dict[str, Any]]:
+    """复用 /balance 的解析、唯一配平与幂等缓存，取规范化反应式与系数。"""
+    status, payload = process_balance(reactant_texts, product_texts)
+    if status != 200:
+        raise _HessBalanceFailure(payload)
+
+    reactants = list(parse_side(reactant_texts, "反应物"))
+    products = list(parse_side(product_texts, "生成物"))
+    coefficient_map = {
+        species_key(sp): coef
+        for sp, coef in zip(
+            (*reactants, *products), payload["coefficients"]["vector"]
+        )
+    }
+    return (
+        BalancedReaction(
+            reactants=tuple(reactants),
+            products=tuple(products),
+            coefficients=coefficient_map,
+        ),
+        payload["normalized"],
+    )
+
+
+class _HessBalanceFailure(Exception):
+    """目标/已知反应配平失败，携带已组装好的结构化错误负载。"""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(payload["error"]["message"])
+        self.payload = payload
+
+
+def _annotate_hess_error(
+    payload: dict[str, Any], *, target: bool, index: int | None
+) -> dict[str, Any]:
+    """给配平阶段的结构化错误补充 target / known_reactions[i] 定位。"""
+    body = dict(payload)
+    error = dict(body["error"])
+    details = dict(error.get("details") or {})
+    if target:
+        details["reaction"] = "target"
+    else:
+        details["reaction"] = "known_reactions"
+        details["index"] = index
+    error["details"] = details
+    body["error"] = error
+    # 反应配平级别的 reaction_id/cached 对本接口无意义，避免误导客户端
+    body.pop("reaction_id", None)
+    body.pop("cached", None)
+    return body
+
+
+def process_hess(
+    target_item: dict[str, Any], known_items: list[dict[str, Any]]
+) -> tuple[int, dict[str, Any]]:
+    """盖斯定律反应焓推导，返回 (http_status, payload)。
+
+    目标反应与各已知反应都复用 :func:`process_balance` 的化学式解析、
+    唯一配平与幂等缓存（配平失败沿用其结构化错误并在 details 中补
+    ``reaction=target`` 或 ``known_reactions`` + ``index``）；随后解析
+    各已知反应焓（可负十进制字符串，非法聚合为 422 INVALID_REQUEST），
+    调用 :func:`app.thermochemistry.solve_hess` 以精确有理数求已知反应
+    的有符号线性组合（允许反向与分数倍）等于目标计量向量，推导目标
+    反应焓并给出合并抵消后的逐物种净系数。目标不在张成空间内返回
+    422 HESS_NOT_DERIVABLE；多种组合导出不同反应焓返回 422
+    HESS_AMBIGUOUS。该接口为无状态计算，不写盖斯结果缓存。
+    """
+    # ---- 目标反应配平
+    try:
+        target_rxn, target_normalized = _balanced_reaction(
+            target_item["reactants"], target_item["products"]
+        )
+    except _HessBalanceFailure as failure:
+        return STATUS_CODES[failure.payload["error"]["code"]], _annotate_hess_error(
+            failure.payload, target=True, index=None
+        )
+
+    # ---- 已知反应配平 + 反应焓解析
+    known: list[HessKnownReaction] = []
+    normalized_blocks: list[dict[str, Any]] = []
+    invalid_enthalpies: list[dict[str, Any]] = []
+
+    for index, item in enumerate(known_items):
+        try:
+            balanced, normalized = _balanced_reaction(
+                item["reactants"], item["products"]
+            )
+        except _HessBalanceFailure as failure:
+            return (
+                STATUS_CODES[failure.payload["error"]["code"]],
+                _annotate_hess_error(
+                    failure.payload, target=False, index=index
+                ),
+            )
+
+        enthalpy_text = item["enthalpy_kj"]
+        try:
+            enthalpy = parse_enthalpy(enthalpy_text)
+        except ValueError:
+            invalid_enthalpies.append(
+                {"index": index, "enthalpy_kj": enthalpy_text}
+            )
+            enthalpy = Fraction(0)
+
+        known.append(
+            HessKnownReaction(
+                reactants=balanced.reactants,
+                products=balanced.products,
+                coefficients=balanced.coefficients,
+                enthalpy=enthalpy,
+            )
+        )
+        normalized_blocks.append(normalized)
+
+    if invalid_enthalpies:
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "已知反应焓必须是有限的十进制字符串（可负、可为 0，如 "
+                "\"-285.8\"），单位 kJ，不能为 NaN、无穷、非数字字符串"
+                "或 JSON 数字",
+                {"invalid_enthalpies": invalid_enthalpies},
+            ),
+        }
+
+    # ---- 盖斯推导
+    try:
+        solution = solve_hess(target_rxn, known)
+    except HessError as exc:
+        return STATUS_CODES[exc.code], {
+            "error": error_payload(exc.code, exc.message, dict(exc.details)),
+        }
+
+    # ---- 渲染
+    normalized_name = {}
+    for rxn in (target_rxn, *known):
+        for sp in (*rxn.reactants, *rxn.products):
+            normalized_name[species_key(sp)] = sp.normalized
+
+    known_blocks: list[dict[str, Any]] = []
+    for index, item in enumerate(known_items):
+        multiplier = solution.multipliers[index]
+        known_blocks.append(
+            {
+                "index": index,
+                "reactants": item["reactants"],
+                "products": item["products"],
+                "enthalpy_kj": item["enthalpy_kj"],
+                "normalized": normalized_blocks[index],
+                "multiplier": fraction_to_decimal_string(multiplier),
+                "contribution_kj": fraction_to_decimal_string(
+                    multiplier * known[index].enthalpy
+                ),
+            }
+        )
+
+    net_coefficients = [
+        {
+            "normalized": normalized_name[key],
+            "coefficient": fraction_to_decimal_string(value),
+        }
+        for key, value in sorted(
+            solution.net_coefficients.items(),
+            key=lambda kv: normalized_name[kv[0]],
+        )
+    ]
+
+    return 200, {
+        "target": {
+            "reactants": target_item["reactants"],
+            "products": target_item["products"],
+            "normalized": target_normalized,
+        },
+        "known_reactions": known_blocks,
+        "target_enthalpy_kj": fraction_to_decimal_string(solution.target_enthalpy),
+        "net_coefficients": net_coefficients,
     }
