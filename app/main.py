@@ -26,6 +26,10 @@
   的同位素质量数与非负丰度（和为 1），按独立原子抽样（多项分布）枚举
   全部名义质量与概率，同质量组合合并，以最简分数返回按质量升序的峰
   列表与最高概率峰；
+* ``POST /thermochemistry/hess`` 赫斯定律反应焓推导：目标反应 + 至多
+  6 条已知反应（各含反应物、生成物、以 kJ 表示的反应焓），以精确有理
+  数求已知反应计量向量的有符号（允许反向、分数倍）线性组合复现目标
+  反应，返回各反应倍数、推导反应焓与合并抵消后的逐物种净系数；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -44,6 +48,8 @@ from .models import (
     BalanceResponse,
     BlendRequest,
     BlendResponse,
+    HessRequest,
+    HessResponse,
     IsotopeEnvelopeRequest,
     IsotopeEnvelopeResponse,
     ReactionRequest,
@@ -65,6 +71,7 @@ from .service import (
     process_analyze,
     process_balance,
     process_blend,
+    process_hess,
     process_isotope_envelope,
     process_reverse_plan,
     process_sequence,
@@ -296,6 +303,26 @@ async def isotopes_envelope(request: IsotopeEnvelopeRequest):
     status, payload = process_isotope_envelope(
         request.formula,
         [item.model_dump() for item in request.elements],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/thermochemistry/hess",
+    response_model=HessResponse,
+    tags=["热化学"],
+    summary="赫斯定律反应焓推导：已知反应的有符号线性组合 -> 目标反应焓",
+    responses={
+        400: {"description": "目标或某条已知反应的化学式无法解析"},
+        409: {"description": "目标或某条已知反应同侧重复物种"},
+        422: {"description": "某反应无法唯一配平 / 反应焓非法 / "
+              "目标不在张成空间（HESS_UNDERIVABLE）/ 组合歧义（HESS_AMBIGUOUS）"},
+    },
+)
+async def thermochemistry_hess(request: HessRequest):
+    status, payload = process_hess(
+        request.target.model_dump(),
+        [item.model_dump() for item in request.known_reactions],
     )
     return JSONResponse(status_code=status, content=payload)
 

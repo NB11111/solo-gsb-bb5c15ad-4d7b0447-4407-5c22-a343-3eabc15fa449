@@ -76,6 +76,20 @@ def decimal_to_fraction(value: Decimal) -> Fraction:
     return Fraction(numerator, 10**-exponent)
 
 
+def parse_enthalpy(text: str) -> Decimal:
+    """把反应焓十进制字符串解析为**可带符号**的有限 :class:`Decimal`。
+
+    与 :func:`parse_moles` 的区别仅在于允许负值（放热反应 ΔH<0）；
+    同样拒绝 NaN / Infinity、非数字与过大数量级，允许科学计数法。
+    """
+    value = Decimal(text.strip())
+    if not value.is_finite():
+        raise ValueError("反应焓不能是 NaN 或无穷大")
+    if value.adjusted() > MAX_ABS_EXPONENT or value.as_tuple().exponent < -MAX_ABS_EXPONENT:
+        raise ValueError(f"反应焓的数量级超出允许范围（±1e{MAX_ABS_EXPONENT}）")
+    return value
+
+
 def _factor_count(n: int, p: int) -> int:
     count = 0
     while n % p == 0:

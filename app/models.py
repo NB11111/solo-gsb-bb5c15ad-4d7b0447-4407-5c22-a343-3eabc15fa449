@@ -809,6 +809,91 @@ class BlendResponse(BaseModel):
     )
 
 
+# ------------------------------------------------------------ 赫斯定律反应焓推导
+class HessKnownReaction(ReactionRequest):
+    """一条已知反应：反应物/生成物 + 以 kJ 表示的反应焓十进制字符串。"""
+
+    enthalpy_kj: str = Field(
+        ...,
+        min_length=1,
+        description="该已知反应的反应焓（ΔH），单位 kJ，**可带符号的十进制"
+        "字符串**（如 \"-285.8\"、\"0\"、\"1e2\"）；不要传 JSON 数字以避免浮点误差。"
+        "符号约定：放热为负、吸热为正，与反应书写方向一致（反向使用时自动变号）",
+        examples=["-285.8"],
+    )
+
+    @field_validator("enthalpy_kj")
+    @classmethod
+    def _strip_enthalpy(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("反应焓必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("反应焓不能为空白字符串")
+        return stripped
+
+
+class HessRequest(BaseModel):
+    """``POST /thermochemistry/hess`` 请求：目标反应 + 至多 6 条已知反应。"""
+
+    target: ReactionRequest = Field(
+        ...,
+        description="待推导反应焓的目标反应（反应物/生成物，须能唯一配平）",
+    )
+    known_reactions: list[HessKnownReaction] = Field(
+        ...,
+        min_length=1,
+        max_length=6,
+        description="已知反应，1～6 条；每条含反应物、生成物与以 kJ 表示的"
+        "反应焓十进制字符串，均须能唯一配平；允许以反向或分数倍组合使用",
+    )
+
+
+class HessKnownReactionResult(BaseModel):
+    """一条已知反应的配平回显与推导所用倍数。"""
+
+    index: int = Field(description="从 0 开始的已知反应序号（与请求顺序一致）")
+    reactants: list[str] = Field(description="规范化反应物（按规范物种排序）")
+    products: list[str] = Field(description="规范化生成物（按规范物种排序）")
+    equation: str = Field(description="规范化并配平后的化学方程式")
+    enthalpy_kj: str = Field(description="客户端提交的反应焓（kJ，回显）")
+    multiplier: str = Field(
+        description="该已知反应在组合中的倍数，最简分数字符串（如 \"2\"、\"-1/2\"）；"
+        "负值表示反向使用，分数表示分数倍使用"
+    )
+    multiplier_used: str = Field(
+        description="实际采用的反应焓贡献 = 倍数 × 反应焓（kJ，十进制字符串）"
+    )
+
+
+class HessNetCoefficient(BaseModel):
+    """合并抵消后单个物种的净系数。"""
+
+    normalized: str = Field(description="规范化化学式")
+    coefficient: str = Field(
+        description="净计量系数，最简分数字符串：生成物为正、反应物为负，"
+        "中间物种完全抵消时为 \"0\""
+    )
+    side: Literal["product", "reactant", "cancelled"] = Field(
+        description="净系数为正属生成物侧 / 为负属反应物侧 / 为 0 表示完全抵消"
+    )
+
+
+class HessResponse(BaseModel):
+    target: NormalizedReaction = Field(description="规范化并配平后的目标反应")
+    known_reactions: list[HessKnownReactionResult] = Field(
+        description="各已知反应的配平回显、反应焓与推导所用倍数（与请求顺序一致）"
+    )
+    derived_enthalpy_kj: str = Field(
+        description="推导出的目标反应焓 ΔH（kJ，十进制字符串）；等于各已知"
+        "反应 倍数 × 反应焓 之和，负号表示放热"
+    )
+    net_coefficients: list[HessNetCoefficient] = Field(
+        description="全部涉及物种（目标 ∪ 已知反应）合并抵消后的逐物种净系数，"
+        "按规范化化学式排序；含完全抵消为 0 的中间物种"
+    )
+
+
 # ------------------------------------------------------------ 同位素名义质量峰分布
 class IsotopeItem(BaseModel):
     """一种同位素：正整数质量数与非负丰度十进制字符串。"""

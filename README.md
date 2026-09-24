@@ -35,7 +35,13 @@
     的同位素质量数、丰度（非负十进制字符串，每组和恰为 1），按独立原子
     抽样（多项分布）枚举全部可能的名义质量与精确概率，同质量组合合并，
     以最简分数字符串返回按质量升序的全部峰与最高概率峰（并列取质量较小者）；
-12. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+12. `/thermochemistry/hess` 做**赫斯定律反应焓推导**：提交目标反应与至多
+    6 条已知反应（各含反应物、生成物与以 kJ 表示、可带符号的反应焓十进制
+    字符串），复用唯一配平按规范物种建立生成物为正、反应物为负的计量向量，
+    以精确有理数求已知向量的有符号线性组合（允许反向与分数倍使用）复现
+    目标反应，返回各已知反应倍数、推导出的目标反应焓与合并抵消后的逐物种
+    净系数；目标不在张成空间时报不可推导，多种组合导出不同反应焓时报歧义；
+13. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -145,6 +151,22 @@ curl -X POST http://localhost:8000/api/v1/isotopes/envelope \
   }'
 ```
 
+赫斯定律反应焓推导——由 C 与 H₂ 的燃烧焓、CH₄ 的燃烧焓求 CH₄ 标准生成焓
+（第 3 条燃烧反应需反向使用，ΔH = −393.5 + (−571.6) + 890.3 = −74.8 kJ）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/thermochemistry/hess \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target": {"reactants": ["C", "H2"], "products": ["CH4"]},
+    "known_reactions": [
+      {"reactants": ["C", "O2"], "products": ["CO2"], "enthalpy_kj": "-393.5"},
+      {"reactants": ["H2", "O2"], "products": ["H2O"], "enthalpy_kj": "-571.6"},
+      {"reactants": ["CH4", "O2"], "products": ["CO2", "H2O"], "enthalpy_kj": "-890.3"}
+    ]
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -157,7 +179,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 379 个测试
+pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素/赫斯定律）
 ```
 
 ---
@@ -176,6 +198,7 @@ pytest          # 379 个测试
 | POST | `/api/v1/inventory/allocate` | 试剂批次 FEFO 领用分配：按失效日期优先、同日批号升序跨批次扣减，跳过过期/隔离批次，返回每批领用/余量、未满足需求与汇总状态 |
 | POST | `/api/v1/solutions/blend` | 溶液配制：不超过 4 种母液 + 目标终体积与各溶质目标浓度 → 满足全部目标浓度的最小母液取用量、补水量与最终浓度 |
 | POST | `/api/v1/isotopes/envelope` | 同位素名义质量峰分布：化学式 + 每元素同位素质量数/丰度 → 按质量升序的全部名义质量峰（最简分数概率）与最高概率峰 |
+| POST | `/api/v1/thermochemistry/hess` | 赫斯定律反应焓推导：目标反应 + 至多 6 条已知反应（含 kJ 反应焓）→ 各反应倍数（可反向/分数倍）、推导反应焓与合并抵消后的逐物种净系数 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -999,7 +1022,112 @@ curl -X POST http://localhost:8000/api/v1/isotopes/envelope \
 
 该接口为无状态计算（不读写幂等缓存）；同一请求重复调用得到完全一致的结果。
 
-### 2.11 幂等与查询
+### 2.11 赫斯定律反应焓推导 `POST /api/v1/thermochemistry/hess`
+
+提交一个**目标反应**与 **1～6 条已知反应**（每条含反应物、生成物与
+`enthalpy_kj`——以 kJ 表示、**可带符号的有限十进制字符串**，放热为负、
+吸热为正，与反应书写方向一致）。服务端对每个反应复用既有解析器与
+**唯一配平**，按规范物种建立**生成物为正、反应物为负**的有符号计量向量，
+然后以精确有理数（全程不经过 `float`）求解线性组合
+
+    A·x = t（A 的列为已知反应向量，t 为目标反应向量）
+
+倍数 `x` 的每个分量都是有理数，**负值表示反向使用、分数表示分数倍使用**。
+推导反应焓 = Σ 倍数 × 已知反应焓（反向自动变号）。
+
+请求体：
+
+```json
+{
+  "target": {"reactants": ["C", "H2"], "products": ["CH4"]},
+  "known_reactions": [
+    {"reactants": ["C", "O2"], "products": ["CO2"], "enthalpy_kj": "-393.5"},
+    {"reactants": ["H2", "O2"], "products": ["H2O"], "enthalpy_kj": "-571.6"},
+    {"reactants": ["CH4", "O2"], "products": ["CO2", "H2O"], "enthalpy_kj": "-890.3"}
+  ]
+}
+```
+
+上例即 CH₄ 标准生成焓：`C + O2 -> CO2`（×1）、`2H2 + O2 -> 2H2O`（×1）、
+`CH4 + 2O2 -> CO2 + 2H2O`（**×−1 反向**）相加消去 O₂/CO₂/H₂O，得到
+`C + 2H2 -> CH4`，ΔH = −393.5 + (−571.6) + 890.3 = **−74.8 kJ**。
+
+`200` 响应：
+
+```json
+{
+  "target": {
+    "reactants": ["C", "H2"],
+    "products": ["CH4"],
+    "equation": "C + 2H2 -> CH4"
+  },
+  "known_reactions": [
+    {"index": 0, "reactants": ["C", "O2"], "products": ["CO2"],
+     "equation": "C + O2 -> CO2", "enthalpy_kj": "-393.5",
+     "multiplier": "1", "multiplier_used": "-393.5"},
+    {"index": 1, "reactants": ["H2", "O2"], "products": ["H2O"],
+     "equation": "2H2 + O2 -> 2H2O", "enthalpy_kj": "-571.6",
+     "multiplier": "1", "multiplier_used": "-571.6"},
+    {"index": 2, "reactants": ["CH4", "O2"], "products": ["CO2", "H2O"],
+     "equation": "CH4 + 2O2 -> CO2 + 2H2O", "enthalpy_kj": "-890.3",
+     "multiplier": "-1", "multiplier_used": "890.3"}
+  ],
+  "derived_enthalpy_kj": "-74.8",
+  "net_coefficients": [
+    {"normalized": "C", "coefficient": "-1", "side": "reactant"},
+    {"normalized": "CH4", "coefficient": "1", "side": "product"},
+    {"normalized": "CO2", "coefficient": "0", "side": "cancelled"},
+    {"normalized": "H2", "coefficient": "-2", "side": "reactant"},
+    {"normalized": "H2O", "coefficient": "0", "side": "cancelled"},
+    {"normalized": "O2", "coefficient": "0", "side": "cancelled"}
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `target` | 规范化并唯一配平后的目标反应 |
+| `known_reactions[].index` | 从 0 开始的已知反应序号（与请求顺序一致） |
+| `known_reactions[].multiplier` | 该反应在组合中的倍数，**最简分数字符串**（`"1"`、`"-1"`、`"1/2"`、`"3/2"`）；负为反向、分数为分数倍 |
+| `known_reactions[].multiplier_used` | 该反应的实际焓贡献 = 倍数 × 反应焓（kJ 十进制字符串） |
+| `derived_enthalpy_kj` | 推导出的目标反应焓 ΔH（kJ 十进制字符串），负号表示放热 |
+| `net_coefficients[]` | 全部涉及物种（目标 ∪ 已知反应）**合并抵消后的逐物种净系数**，最简分数字符串，按规范化化学式排序 |
+| `net_coefficients[].side` | `product`（净系数为正）/ `reactant`（为负）/ `cancelled`（为 0，中间物种完全抵消） |
+
+倍数以最简分数给出（如由 `2C + O2 -> 2CO`（−221）与
+`2CO + O2 -> 2CO2`（−566）各取 **1/2** 组合出 `C + O2 -> CO2` 时，
+`multiplier` 为 `"1/2"`、`"1/2"`，推导 ΔH = −393.5 kJ）；反应焓与贡献
+按十进制字符串输出，无限小数按 28 位有效数字银行家舍入，规则同其它
+计量接口。
+
+**可推导性与歧义判定**：对增广矩阵 `[A | t]` 做有理数 RREF——
+
+* 出现恒等约束 `0 = 非零`（目标含已知反应从未涉及的物种，或计量关系
+  互相矛盾）时返回 `422 HESS_UNDERIVABLE`；目标独有物种在
+  `details.target_only_species` 中列出；
+* 组合不唯一（已知反应线性相关）时，沿每个齐次方向检查反应焓的变化：
+  存在使总焓改变的方向 -> `422 HESS_AMBIGUOUS`（已知数据不自洽）；
+  所有方向的焓变化都为 0 -> 各组合导出的反应焓相同，**正常返回**
+  （取自由变量为 0 的一个特解，如自洽的闭合反应循环）。
+
+错误响应：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 目标或某条已知反应化学式无法解析（`details.where` 为 `target` / `known_reactions`，后者附 `details.index`） | `400 FORMULA_PARSE_ERROR` |
+| 目标或某条已知反应同侧物种重复 | `409 DUPLICATE_SPECIES` |
+| 目标或某条已知反应无法唯一配平 / 无法配平 | `422 NON_UNIQUE_BALANCE` / `IMPOSSIBLE_BALANCE` 等 |
+| 某条反应焓非法：NaN、Infinity、非数字、JSON 数字（`details.invalid_enthalpies` 附序号与原值）；已知反应为 0 条或超过 6 条、缺字段等结构问题 | `422 INVALID_REQUEST` |
+| 目标反应不在已知反应向量的张成空间内 | `422 HESS_UNDERIVABLE` |
+| 多组组合导出不同的目标反应焓 | `422 HESS_AMBIGUOUS` |
+
+该接口为无状态计算（不读写幂等缓存，响应不含 `reaction_id`）；同一请求
+重复调用得到完全一致的结果。离子反应同样适用（电子 `e-` 作为物种参与
+配平与抵消，如两个还原半反应组合为置换反应时 `e-` 净系数为 `"0"`）。
+
+### 2.12 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -1081,6 +1209,8 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | `INVALID_BLEND` | 422 | `/solutions/blend` 母液标识或溶质重复、目标溶质重复、浓度/体积非法（含 JSON 数字）或目标终体积非正，问题明细在 `details` 中聚合返回 |
 | `NO_FEASIBLE_BLEND` | 422 | `/solutions/blend` 无可行解：在可用体积与终体积约束下不存在满足全部目标浓度的非负取用量（`details.insufficient_solutes` 给出单溶质供应诊断） |
 | `INVALID_ISOTOPE` | 422 | `/isotopes/envelope` 同位素输入非法：元素组缺失/重复/多余/非法、质量数重复、丰度非法或精确之和不为 1、超过元素/原子数上限，问题明细在 `details` 中聚合返回 |
+| `HESS_UNDERIVABLE` | 422 | `/thermochemistry/hess` 目标反应不在已知反应计量向量的张成空间内（含目标独有物种，见 `details.target_only_species`），任何有符号/分数倍组合都无法复现目标反应 |
+| `HESS_AMBIGUOUS` | 422 | `/thermochemistry/hess` 存在多组线性组合可复现目标反应的计量向量，但按各组已知反应焓导出的目标反应焓不一致（已知数据不自洽） |
 | `NOT_FOUND` | 404 | `reaction_id` 不在缓存中 |
 
 不唯一示例：`C + O2 -> CO + CO2` 缺少约束，返回
@@ -1108,10 +1238,11 @@ app/
   allocation.py     试剂批次 FEFO 领用分配：纯度换算有效物质、跨批拆分、过期/隔离跳过、未满足需求与汇总，Fraction 精确计算
   blending.py       溶液配制：目标溶质摩尔守恒 + 可用体积/终体积约束的精确线性规划（顶点枚举），母液总量最小、再按输入顺序字典序最小，Fraction 精确计算
   isotopes.py       同位素名义质量峰分布：逐元素多项分布枚举全部计数向量（不截断零概率组合）、同质量合并、跨元素卷积，Fraction 精确计算
+  hess.py           赫斯定律反应焓推导：规范物种有符号计量向量、增广矩阵有理数 RREF 判定张成/歧义、有符号（反向/分数倍）组合求解，Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布共 379 个测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布、赫斯定律反应焓推导测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

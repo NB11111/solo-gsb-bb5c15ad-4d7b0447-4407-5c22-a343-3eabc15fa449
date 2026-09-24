@@ -18,6 +18,7 @@ from .allocation import (
 from .balancer import (
     VARIANT_SPACE_TOO_LARGE,
     BalanceError,
+    SolvedReaction,
     Species,
     build_balanced_view,
     build_raw_view,
@@ -27,6 +28,7 @@ from .balancer import (
 )
 from .blending import Stock, solve_blend
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
+from .hess import HessError, KnownReaction, normalized_by_key, solve_hess
 from .isotopes import (
     MAX_ELEMENTS,
     MAX_TOTAL_ATOMS,
@@ -43,6 +45,7 @@ from .stoichiometry import (
     compute_yields,
     decimal_to_fraction,
     fraction_to_decimal_string,
+    parse_enthalpy,
     parse_moles,
 )
 
@@ -62,6 +65,8 @@ STATUS_CODES = {
     "INVALID_BLEND": 422,
     "NO_FEASIBLE_BLEND": 422,
     "INVALID_ISOTOPE": 422,
+    "HESS_UNDERIVABLE": 422,
+    "HESS_AMBIGUOUS": 422,
 }
 
 
@@ -1516,3 +1521,206 @@ def process_isotope_envelope(
         "peaks": [render_peak(peak) for peak in peaks],
         "most_probable": render_peak(top),
     }
+
+
+# ------------------------------------------------------------ 赫斯定律反应焓推导
+def process_hess(
+    target_item: dict[str, Any],
+    known_items: list[dict[str, Any]],
+) -> tuple[int, dict[str, Any]]:
+    """赫斯定律反应焓推导，返回 (http_status, payload)。
+
+    目标反应与每条已知反应都复用 :func:`process_balance` 的化学式解析与
+    唯一配平（解析失败 400、同侧重复 409、不可唯一配平 422，错误 details
+    中以 ``where``（``target`` / ``known_reactions``）与 ``index`` 定位）；
+    各反应焓必须是可带符号的有限十进制字符串（kJ），非法时聚合为 422
+    INVALID_REQUEST。随后调用 :func:`app.hess.solve_hess` 以精确有理数求
+    已知反应计量向量的有符号线性组合（允许反向与分数倍），目标不在张成
+    空间内返回 422 HESS_UNDERIVABLE，多组组合导出不同反应焓返回 422
+    HESS_AMBIGUOUS；焓相同时正常返回各反应倍数、推导焓与逐物种净系数。
+    配平复用 :func:`process_balance` 的共享幂等缓存（配平类错误因此可能
+    带回 ``reaction_id``），但赫斯推导结果本身不单独缓存，成功响应不含
+    ``reaction_id`` / ``cached``。
+    """
+    # ---- 目标反应：复用唯一配平（含解析、去重、幂等缓存）
+    target_status, target_payload = process_balance(
+        target_item["reactants"], target_item["products"]
+    )
+    if target_status != 200:
+        error = target_payload.get("error")
+        if error is not None:
+            body = _hess_balance_error_body("target", None, error)
+            rid = target_payload.get("reaction_id")
+            if rid is not None:
+                body["reaction_id"] = rid
+            return target_status, body
+        # 理论上不会走到：非 200 必为结构化错误
+        return target_status, target_payload
+
+    target_reactants = list(parse_side(target_item["reactants"], "反应物"))
+    target_products = list(parse_side(target_item["products"], "生成物"))
+    coef_map = {
+        species_key(sp): coef
+        for sp, coef in zip(
+            (*target_reactants, *target_products),
+            target_payload["coefficients"]["vector"],
+        )
+    }
+    target_solved = _solved_from_parts(
+        target_reactants, target_products, coef_map
+    )
+
+    # ---- 已知反应：逐条唯一配平 + 反应焓解析，聚合全部可定位的问题
+    known_solved: list = []
+    known_echos: list[dict[str, Any]] = []
+    enthalpy_fractions: list[Fraction] = []
+    invalid_enthalpies: list[dict[str, Any]] = []
+
+    for index, item in enumerate(known_items):
+        status, payload = process_balance(item["reactants"], item["products"])
+        if status != 200:
+            error = payload["error"]
+            body = _hess_balance_error_body(
+                "known_reactions", index, error
+            )
+            rid = payload.get("reaction_id")
+            if rid is not None:
+                body["reaction_id"] = rid
+            return status, body
+
+        reactants = list(parse_side(item["reactants"], "反应物"))
+        products = list(parse_side(item["products"], "生成物"))
+        cmap = {
+            species_key(sp): coef
+            for sp, coef in zip(
+                (*reactants, *products),
+                payload["coefficients"]["vector"],
+            )
+        }
+        solved = _solved_from_parts(reactants, products, cmap)
+        known_solved.append(solved)
+
+        enthalpy_text = item["enthalpy_kj"]
+        try:
+            enthalpy = parse_enthalpy(enthalpy_text)
+        except (ValueError, InvalidOperation):
+            invalid_enthalpies.append(
+                {"index": index, "enthalpy_kj": enthalpy_text}
+            )
+            enthalpy_fractions.append(Fraction(0))
+        else:
+            enthalpy_fractions.append(decimal_to_fraction(enthalpy))
+
+        known_echos.append(
+            {
+                "index": index,
+                "reactants": [sp.normalized for sp in reactants],
+                "products": [sp.normalized for sp in products],
+                "equation": payload["normalized"]["equation"],
+                "enthalpy_kj": enthalpy_text,
+            }
+        )
+
+    if invalid_enthalpies:
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "已知反应焓必须是以 kJ 表示的有限十进制字符串"
+                "（可带符号，如 \"-285.8\"，不能为 JSON 数字、NaN 或无穷大）",
+                {"invalid_enthalpies": invalid_enthalpies},
+            ),
+        }
+
+    known = [
+        KnownReaction(solved=solved, enthalpy=h)
+        for solved, h in zip(known_solved, enthalpy_fractions)
+    ]
+
+    try:
+        solution = solve_hess(target_solved, known)
+    except HessError as exc:
+        details = dict(exc.details)
+        # 规范键对客户端不友好：附带规范化物种名
+        name_by_key = dict(normalized_by_key(target_solved))
+        for kr in known:
+            name_by_key.update(normalized_by_key(kr.solved))
+        if "target_only_species" in details:
+            details["target_only_species"] = [
+                name_by_key.get(key, key) for key in details["target_only_species"]
+            ]
+        return STATUS_CODES[exc.code], {
+            "error": error_payload(exc.code, exc.message, details),
+        }
+
+    # ---- 逐物种净系数：合并全部反应涉及的规范物种，按规范化名称排序
+    name_by_key = dict(normalized_by_key(target_solved))
+    for kr in known:
+        name_by_key.update(normalized_by_key(kr.solved))
+
+    ordered_keys = sorted(
+        solution.species_order, key=lambda key: name_by_key.get(key, key)
+    )
+    net_coefficients = []
+    for key in ordered_keys:
+        value = solution.net_coefficients[key]
+        if value > 0:
+            side = "product"
+        elif value < 0:
+            side = "reactant"
+        else:
+            side = "cancelled"
+        net_coefficients.append(
+            {
+                "normalized": name_by_key.get(key, key),
+                "coefficient": str(value),
+                "side": side,
+            }
+        )
+
+    return 200, {
+        "target": target_payload["normalized"],
+        "known_reactions": [
+            {
+                **echo,
+                "multiplier": str(multiplier),
+                "multiplier_used": fraction_to_decimal_string(
+                    multiplier * enthalpy_fractions[echo["index"]]
+                ),
+            }
+            for echo, multiplier in zip(known_echos, solution.multipliers)
+        ],
+        "derived_enthalpy_kj": fraction_to_decimal_string(solution.enthalpy),
+        "net_coefficients": net_coefficients,
+    }
+
+
+def _hess_balance_error_body(
+    where: str, index: int | None, error: dict[str, Any]
+) -> dict[str, Any]:
+    """在既有结构化错误的 details 上补充 hess 定位信息（不修改原对象）。"""
+    new_error = dict(error)
+    details = dict(new_error.get("details") or {})
+    details["where"] = where
+    if index is not None:
+        details["index"] = index
+    new_error["details"] = details
+    return {"error": new_error}
+
+
+def _solved_from_parts(
+    reactants: list[Species],
+    products: list[Species],
+    coefficient_map: dict[str, int],
+) -> SolvedReaction:
+    """由已解析物种与配平系数映射构造 SolvedReaction（复用既有配平结果）。"""
+    species = [*reactants, *products]
+    coefficients = tuple(coefficient_map[species_key(sp)] for sp in species)
+    elements = tuple(
+        sorted({el for sp in species for el in sp.formula.composition})
+    )
+    return SolvedReaction(
+        reactants=tuple(reactants),
+        products=tuple(products),
+        coefficients=coefficients,
+        elements=elements,
+    )
